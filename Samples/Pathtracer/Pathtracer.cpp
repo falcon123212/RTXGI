@@ -230,6 +230,9 @@ bool Pathtracer::Init(int argc, const char* const* argv)
         nvrhi::BindingLayoutItem::StructuredBuffer_UAV(3),
     };
     m_sharcBindingLayout = GetDevice()->createBindingLayout(bindingLayoutDesc);
+
+    // Compact snapshots: hash entries, resolved data, snapshot records, counter
+    m_sharcSnapshotBindingLayout = GetDevice()->createBindingLayout(bindingLayoutDesc);
 #endif // ENABLE_SHARC
 
     CreateCommonPipelines();
@@ -279,6 +282,31 @@ bool Pathtracer::Init(int argc, const char* const* argv)
             nvrhi::BindingSetItem::StructuredBuffer_UAV(3, m_sharcResolvedBuffer),
         };
         m_sharcBindingSet = GetDevice()->createBindingSet(bindingSetDesc, m_sharcBindingLayout);
+
+        bufferDesc.structStride = sizeof(uint32_t);
+        bufferDesc.byteSize = sizeof(uint32_t);
+        bufferDesc.canHaveRawViews = false;
+        bufferDesc.debugName = "m_sharcSnapshotCounter";
+        m_sharcSnapshotCounter = GetDevice()->createBuffer(bufferDesc);
+
+        nvrhi::BufferDesc readbackDesc;
+        readbackDesc.byteSize = sizeof(uint32_t);
+        readbackDesc.cpuAccess = nvrhi::CpuAccessMode::Read;
+        readbackDesc.debugName = "m_sharcSnapshotCounterReadback";
+        m_sharcSnapshotCounterReadback = GetDevice()->createBuffer(readbackDesc);
+
+        auto createSnapshotPSO = [&](const char* entryPoint) {
+            nvrhi::ComputePipelineDesc pipelineDesc;
+            if (m_api == nvrhi::GraphicsAPI::D3D12)
+                pipelineDesc.bindingLayouts = { m_sharcSnapshotBindingLayout };
+            else
+                pipelineDesc.bindingLayouts = { m_dummyLayouts[0], m_dummyLayouts[1], m_dummyLayouts[2], m_sharcSnapshotBindingLayout };
+            pipelineDesc.CS = m_shaderFactory->CreateShader("app/SharcSnapshot.hlsl", entryPoint, nullptr, nvrhi::ShaderType::Compute);
+            return GetDevice()->createComputePipeline(pipelineDesc);
+        };
+        m_sharcSnapshotCountPSO = createSnapshotPSO("sharcSnapshotCount");
+        m_sharcSnapshotPackPSO = createSnapshotPSO("sharcSnapshotPack");
+        m_sharcSnapshotRestorePSO = createSnapshotPSO("sharcSnapshotRestore");
     }
 #endif // ENABLE_SHARC
 
@@ -351,6 +379,10 @@ void Pathtracer::SceneUnloading()
     m_bindingCache->Clear();
     m_pathtracerScene->OnUnloading(m_ui);
     m_accelStructManager->RequestRebuild();
+#if ENABLE_SHARC
+    m_sharcSnapshots.clear();
+    m_sharcStateKey = 0;
+#endif // ENABLE_SHARC
 
     BackBufferResizing();
 }
@@ -514,6 +546,10 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
         m_accumulationBuffer = device->createTexture(desc);
     }
 
+#if ENABLE_SHARC
+    SharcHandleLightingState();
+#endif // ENABLE_SHARC
+
     m_commandList->open();
 
     if (m_accelStructManager->NeedsRebuild())
@@ -655,7 +691,7 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
         constants.sharcRoughnessThreshold = m_ui.sharcRoughnessThreshold;
         constants.sharcCameraPositionPrev.xyz() = sharcCameraPositionPrev;
         constants.sharcCameraPosition.xyz() = sharcCameraPosition;
-        constants.sharcAccumulationFrameNum = m_ui.sharcAccumulationFrameNum;
+        constants.sharcAccumulationFrameNum = GetSharcAccumulationFrameNum();
         constants.sharcStaleFrameNum = m_ui.sharcStaleFrameFrameNum;
         constants.sharcEnableAntifirefly = m_ui.sharcEnableAntiFireflyFilter;
     }
@@ -855,9 +891,10 @@ void Pathtracer::Render(nvrhi::IFramebuffer* framebuffer)
         static bool enableMaterialDemodulation = m_ui.sharcEnableMaterialDemodulation;
         if (m_ui.sharcEnableUpdate)
         {
-            if (m_ui.sharcEnableClear || m_pathtracerScene->WasReloaded() || (enableMaterialDemodulation != m_ui.sharcEnableMaterialDemodulation))
+            if (m_ui.sharcEnableClear || m_sharcFlushRequested || m_pathtracerScene->WasReloaded() || (enableMaterialDemodulation != m_ui.sharcEnableMaterialDemodulation))
             {
                 enableMaterialDemodulation = m_ui.sharcEnableMaterialDemodulation;
+                m_sharcFlushRequested = false;
 
                 m_commandList->clearBufferUInt(m_sharcHashEntriesBuffer, m_sharcInvalidEntry);
                 m_commandList->clearBufferUInt(m_sharcAccumulationBuffer, 0);
@@ -1111,3 +1148,182 @@ PathtracerPipelines::BindingLayouts Pathtracer::BuildBindingLayouts() const
         layouts.dummy[i] = m_dummyLayouts[i];
     return layouts;
 }
+#if ENABLE_SHARC
+// Number of frames during which the accumulation window ramps up after a flush
+static const uint32_t c_SharcRampFrames = 30;
+// A state must stay unchanged this many frames before its cache is worth a snapshot
+static const uint32_t c_SharcSnapshotMinStableFrames = 20;
+
+// Hash of everything that changes the light reaching the scene: sun, lights, sky, global toggles
+uint64_t Pathtracer::ComputeLightingStateKey() const
+{
+    uint64_t hash = 14695981039346656037ull;   // FNV-1a
+    auto hashBytes = [&hash](const void* data, size_t size) {
+        const uint8_t* bytes = static_cast<const uint8_t*>(data);
+        for (size_t i = 0; i < size; ++i)
+            hash = (hash ^ bytes[i]) * 1099511628211ull;
+    };
+
+    if (auto sun = m_pathtracerScene->GetSunLight())
+    {
+        LightConstants lightConstants = {};
+        sun->FillLightConstants(lightConstants);
+        hashBytes(&lightConstants, sizeof(lightConstants));
+    }
+    for (const auto& light : m_pathtracerScene->GetScene()->GetSceneGraph()->GetLights())
+    {
+        LightConstants lightConstants = {};
+        light->FillLightConstants(lightConstants);
+        hashBytes(&lightConstants, sizeof(lightConstants));
+    }
+
+    const float3 sky = m_ui.skyColor * (m_ui.enableSky ? m_ui.skyIntensity : 0.0f);
+    const int toggles[2] = { m_ui.enableLighting, m_ui.enableEmissives };
+    hashBytes(&sky, sizeof(sky));
+    hashBytes(toggles, sizeof(toggles));
+
+    return hash ? hash : 1;
+}
+
+// Called once per frame before rendering. On a lighting change, the cache of the state being left
+// is saved, then the cache of the new state is restored if it was seen before, or flushed if it is new.
+// Without this, SHaRC keeps propagating the previous lighting through its multi-bounce feedback.
+void Pathtracer::SharcHandleLightingState()
+{
+    if (m_sharcRampFrame < c_SharcRampFrames)
+        ++m_sharcRampFrame;
+
+    if (!IsSceneLoaded())
+        return;
+
+    const uint64_t key = ComputeLightingStateKey();
+    const uint64_t previousKey = m_sharcStateKey;
+    m_sharcStateKey = key;
+
+    if (key == previousKey || previousKey == 0)
+    {
+        ++m_sharcStateStableFrames;
+        return;
+    }
+
+    const uint32_t stableFrames = m_sharcStateStableFrames;
+    m_sharcStateStableFrames = 0;
+
+    if (!m_ui.sharcEnableStateSnapshots || m_ui.techSelection != TechSelection::Sharc || !m_ui.sharcEnableUpdate)
+        return;
+
+    // The cache still holds the converged lighting of the state being left
+    if (stableFrames >= c_SharcSnapshotMinStableFrames)
+    {
+        auto it = std::find_if(m_sharcSnapshots.begin(), m_sharcSnapshots.end(), [&](const SharcStateSnapshot& s) { return s.stateKey == previousKey; });
+        if (it == m_sharcSnapshots.end())
+        {
+            m_sharcSnapshots.emplace_back();
+            it = std::prev(m_sharcSnapshots.end());
+            it->stateKey = previousKey;
+        }
+        SharcSaveSnapshot(*it);
+    }
+
+    auto known = std::find_if(m_sharcSnapshots.begin(), m_sharcSnapshots.end(), [&](const SharcStateSnapshot& s) { return s.stateKey == key; });
+    if (known != m_sharcSnapshots.end())
+    {
+        SharcRestoreSnapshot(*known);
+        m_sharcRampFrame = ~0u;
+    }
+    else
+    {
+        m_sharcFlushRequested = true;
+        m_sharcRampFrame = 0;
+    }
+}
+
+// Short accumulation window right after a flush, growing back to the user setting
+int Pathtracer::GetSharcAccumulationFrameNum() const
+{
+    if (m_sharcRampFrame < c_SharcRampFrames)
+        return std::min(m_ui.sharcAccumulationFrameNum, 2 + int(m_sharcRampFrame) / 2);
+    return m_ui.sharcAccumulationFrameNum;
+}
+
+nvrhi::BindingSetHandle Pathtracer::CreateSharcSnapshotBindingSet(nvrhi::IBuffer* records)
+{
+    nvrhi::BindingSetDesc bindingSetDesc;
+    bindingSetDesc.bindings = {
+        nvrhi::BindingSetItem::StructuredBuffer_UAV(0, m_sharcHashEntriesBuffer),
+        nvrhi::BindingSetItem::StructuredBuffer_UAV(1, m_sharcResolvedBuffer),
+        nvrhi::BindingSetItem::StructuredBuffer_UAV(2, records),
+        nvrhi::BindingSetItem::StructuredBuffer_UAV(3, m_sharcSnapshotCounter),
+    };
+    return GetDevice()->createBindingSet(bindingSetDesc, m_sharcSnapshotBindingLayout);
+}
+
+void Pathtracer::SharcSnapshotDispatch(nvrhi::ICommandList* commandList, nvrhi::IComputePipeline* pipeline, nvrhi::IBindingSet* bindingSet, uint32_t threadCount)
+{
+    nvrhi::ComputeState computeState;
+    computeState.pipeline = pipeline;
+    if (m_api == nvrhi::GraphicsAPI::D3D12)
+        computeState.bindings = { bindingSet };
+    else
+        computeState.bindings = { m_dummyBindingSets[0], m_dummyBindingSets[1], m_dummyBindingSets[2], bindingSet };
+    commandList->setComputeState(computeState);
+    commandList->dispatch(DivideRoundUp(threadCount, 256u), 1, 1);
+}
+
+static nvrhi::BufferHandle CreateSharcSnapshotRecords(nvrhi::IDevice* device, uint32_t recordCount)
+{
+    const uint32_t recordSize = 24;   // SharcSnapshotRecord in SharcSnapshot.hlsl
+    nvrhi::BufferDesc bufferDesc;
+    bufferDesc.structStride = recordSize;
+    bufferDesc.byteSize = uint64_t(std::max(recordCount, 1u)) * recordSize;
+    bufferDesc.canHaveUAVs = true;
+    bufferDesc.initialState = nvrhi::ResourceStates::UnorderedAccess;
+    bufferDesc.keepInitialState = true;
+    bufferDesc.debugName = "SharcSnapshotRecords";
+    return device->createBuffer(bufferDesc);
+}
+
+// Count the valid entries, allocate exactly that many 24-byte records, pack them.
+// Runs once per lighting event; the CPU waits for the count to size the buffer.
+void Pathtracer::SharcSaveSnapshot(SharcStateSnapshot& snapshot)
+{
+    nvrhi::IDevice* device = GetDevice();
+    nvrhi::CommandListHandle commandList = device->createCommandList();
+
+    nvrhi::BufferHandle countRecords = CreateSharcSnapshotRecords(device, 1);
+    nvrhi::BindingSetHandle countBindingSet = CreateSharcSnapshotBindingSet(countRecords);
+    commandList->open();
+    commandList->clearBufferUInt(m_sharcSnapshotCounter, 0);
+    SharcSnapshotDispatch(commandList, m_sharcSnapshotCountPSO, countBindingSet, m_sharcEntriesNum);
+    commandList->copyBuffer(m_sharcSnapshotCounterReadback, 0, m_sharcSnapshotCounter, 0, sizeof(uint32_t));
+    commandList->close();
+    device->executeCommandList(commandList);
+    device->waitForIdle();
+
+    const uint32_t* count = static_cast<const uint32_t*>(device->mapBuffer(m_sharcSnapshotCounterReadback, nvrhi::CpuAccessMode::Read));
+    snapshot.recordCount = count ? *count : 0;
+    device->unmapBuffer(m_sharcSnapshotCounterReadback);
+
+    snapshot.records = CreateSharcSnapshotRecords(device, snapshot.recordCount);
+    snapshot.bindingSet = CreateSharcSnapshotBindingSet(snapshot.records);
+    commandList->open();
+    commandList->clearBufferUInt(m_sharcSnapshotCounter, 0);
+    SharcSnapshotDispatch(commandList, m_sharcSnapshotPackPSO, snapshot.bindingSet, m_sharcEntriesNum);
+    commandList->close();
+    device->executeCommandList(commandList);
+}
+
+void Pathtracer::SharcRestoreSnapshot(const SharcStateSnapshot& snapshot)
+{
+    nvrhi::IDevice* device = GetDevice();
+    nvrhi::CommandListHandle commandList = device->createCommandList();
+    commandList->open();
+    commandList->clearBufferUInt(m_sharcHashEntriesBuffer, m_sharcInvalidEntry);
+    commandList->clearBufferUInt(m_sharcAccumulationBuffer, 0);
+    commandList->clearBufferUInt(m_sharcResolvedBuffer, 0);
+    if (snapshot.recordCount)
+        SharcSnapshotDispatch(commandList, m_sharcSnapshotRestorePSO, snapshot.bindingSet, snapshot.recordCount);
+    commandList->close();
+    device->executeCommandList(commandList);
+}
+#endif // ENABLE_SHARC

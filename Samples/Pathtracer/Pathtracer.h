@@ -152,6 +152,34 @@ private:
 
     nvrhi::BindingLayoutHandle m_sharcBindingLayout;
     nvrhi::BindingSetHandle m_sharcBindingSet;
+
+    // Lighting state events: flush SHaRC on a new lighting state, restore a compact snapshot on a known one
+    struct SharcStateSnapshot
+    {
+        uint64_t stateKey = 0;
+        uint32_t recordCount = 0;
+        nvrhi::BufferHandle records;
+        nvrhi::BindingSetHandle bindingSet;
+    };
+    std::vector<SharcStateSnapshot> m_sharcSnapshots;
+    nvrhi::BindingLayoutHandle m_sharcSnapshotBindingLayout;
+    nvrhi::ComputePipelineHandle m_sharcSnapshotCountPSO;
+    nvrhi::ComputePipelineHandle m_sharcSnapshotPackPSO;
+    nvrhi::ComputePipelineHandle m_sharcSnapshotRestorePSO;
+    nvrhi::BufferHandle m_sharcSnapshotCounter;
+    nvrhi::BufferHandle m_sharcSnapshotCounterReadback;
+    uint64_t m_sharcStateKey = 0;
+    uint32_t m_sharcStateStableFrames = 0;
+    uint32_t m_sharcRampFrame = ~0u;          // frames since the last flush (~0u = no ramp)
+    bool m_sharcFlushRequested = false;
+
+    uint64_t ComputeLightingStateKey() const;
+    void SharcHandleLightingState();
+    nvrhi::BindingSetHandle CreateSharcSnapshotBindingSet(nvrhi::IBuffer* records);
+    void SharcSnapshotDispatch(nvrhi::ICommandList* commandList, nvrhi::IComputePipeline* pipeline, nvrhi::IBindingSet* bindingSet, uint32_t threadCount);
+    void SharcSaveSnapshot(SharcStateSnapshot& snapshot);
+    void SharcRestoreSnapshot(const SharcStateSnapshot& snapshot);
+    int GetSharcAccumulationFrameNum() const;
 #endif // ENABLE_SHARC
 
     nvrhi::BindingLayoutHandle m_denoiserBindingLayout;

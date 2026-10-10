@@ -147,6 +147,7 @@ struct UIData
 
 #if ENABLE_SHARC
     bool sharcEnableClear = false;
+    bool sharcEnableStateSnapshots = false;     // flush on a new lighting state, restore a snapshot on a known one
     bool sharcEnableUpdate = true;
     bool sharcEnableResolve = true;
     bool sharcEnableAntiFireflyFilter = true;

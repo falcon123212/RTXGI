@@ -275,6 +275,9 @@ void PathtracerUI::buildUI(void)
         if (m_ui.techSelection == TechSelection::Sharc)
         {
             updateAccum |= ImGui::Checkbox("Enable Clear", &m_ui.sharcEnableClear);
+            updateAccum |= ImGui::Checkbox("Lighting State Snapshots", &m_ui.sharcEnableStateSnapshots);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("When the lighting changes (sky, sun, lights), flush the cache for a new state\nor restore the saved cache of a state seen before.");
             updateAccum |= ImGui::Checkbox("Enable Update", &m_ui.sharcEnableUpdate);
             updateAccum |= ImGui::Checkbox("Enable Resolve", &m_ui.sharcEnableResolve);
             updateAccum |= ImGui::Checkbox("Enable Anti Firefly", &m_ui.sharcEnableAntiFireflyFilter);
